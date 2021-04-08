@@ -86,22 +86,58 @@ T pad_val(){
 struct pooling1d_config{
   // IO size
   static const unsigned n_in = 10;
-  static const unsigned pool_size = 2;
-  static const unsigned n_out = n_in / pool_size;
+  static const unsigned pool_width = 2;
+  static const unsigned n_out = n_in / pool_width;
   static const unsigned pad_left = 0;
   static const unsigned pad_right = 0;
   // Pooling function
   static const Pool_Op pool_op = Max;
 };
 
-template<class data_T, typename CONFIG_T>
-void pooling1d(data_T data[CONFIG_T::n_in], data_T res[CONFIG_T::n_out]){
-  for(int ii = 0; ii < CONFIG_T::n_out; ii ++){
-    data_T pool[CONFIG_T::pool_size];
-    for(int jj = 0; jj < CONFIG_T::pool_size; jj++){
-      pool[jj] = data[ii * CONFIG_T::pool_size + jj]; 
-    }
-    res[ii] = pool_op<data_T, CONFIG_T::pool_size, CONFIG_T::pool_op>(pool);
+template<typename CONFIG_T>
+constexpr int pool_op_limit_1d() {
+  return CONFIG_T::n_in * CONFIG_T::n_filt / CONFIG_T::reuse;
+}
+
+template<class data_T, class res_T, typename CONFIG_T>
+void pooling1d_cl(data_T data[CONFIG_T::n_in * CONFIG_T::n_filt], res_T res[CONFIG_T::n_out * CONFIG_T::n_filt]) {
+
+  // TODO partition the arrays according to the reuse factor
+  const int limit = pool_op_limit_1d<CONFIG_T>();
+  #pragma HLS ALLOCATION instances=pool_op limit=limit function
+  // Add any necessary padding
+  unsigned padded_width = CONFIG_T::n_in + CONFIG_T::pad_left + CONFIG_T::pad_right;
+  if (CONFIG_T::pad_left == 0 && CONFIG_T::pad_right == 0) {
+    padded_width -= padded_width - (padded_width / CONFIG_T::stride_width * CONFIG_T::stride_width);
+  }
+
+  for(int ff = 0; ff < CONFIG_T::n_filt; ff++) {
+    // Loop over input image x in steps of stride
+    for(int ii = 0; ii < padded_width; ii += CONFIG_T::stride_width) {
+      data_T pool[CONFIG_T::pool_width];
+      // Keep track of number of pixels in image vs padding region
+      unsigned img_overlap = 0;
+      // Loop over pool window x
+      for(int jj = 0; jj < CONFIG_T::stride_width; jj++) {
+        if(ii+jj < CONFIG_T::pad_left || ii+jj >= (padded_width - CONFIG_T::pad_right)) {
+          // Add padding
+          pool[jj] = pad_val<data_T, CONFIG_T::pool_op>();
+        }else{
+          pool[jj] = data[(ii + jj) * CONFIG_T::n_filt + ff];
+          img_overlap++;
+        }
+      }
+      // do the pooling
+      // TODO in the case of average pooling, need to reduce width to area of pool window
+      // not overlapping padding region
+      res[(ii/CONFIG_T::stride_width)* CONFIG_T::n_filt + ff] =
+          pool_op<data_T, CONFIG_T::pool_width, CONFIG_T::pool_op>(pool);
+      // If the pool op is Average, the zero-padding needs to be removed from the results
+      if(CONFIG_T::pool_op == Average) {
+        data_T rescale = CONFIG_T::pool_width / img_overlap;
+        res[(ii/CONFIG_T::stride_width)* CONFIG_T::n_filt + ff] *= rescale;
+      }
+	  }
   }
 }
 
@@ -125,6 +161,9 @@ struct pooling2d_config{
   static const Pool_Op pool_op = Max;
   // Reuse
   static const unsigned reuse = 1;
+  
+  // Internal data type definitions
+  typedef float accum_t;
 };
 
 template<typename CONFIG_T>
@@ -132,9 +171,9 @@ constexpr int pool_op_limit(){
   return (CONFIG_T::out_height * CONFIG_T::out_width) * CONFIG_T::n_filt / CONFIG_T::reuse;
 }
 
-template<class data_T, typename CONFIG_T>
+template<class data_T, class res_T, typename CONFIG_T>
 void pooling2d_cl(data_T data[CONFIG_T::in_height * CONFIG_T::in_width * CONFIG_T::n_filt],
-               data_T res[CONFIG_T::out_height * CONFIG_T::out_width * CONFIG_T::n_filt]){
+               res_T res[CONFIG_T::out_height * CONFIG_T::out_width * CONFIG_T::n_filt]){
 
   // TODO partition the arrays according to the reuse factor
   const int limit = pool_op_limit<CONFIG_T>();
@@ -183,9 +222,9 @@ void pooling2d_cl(data_T data[CONFIG_T::in_height * CONFIG_T::in_width * CONFIG_
   }
 }
 
-template<class data_T, typename CONFIG_T>
+template<class data_T, class res_T, typename CONFIG_T>
 void pooling2d_cf(data_T data[CONFIG_T::in_height * CONFIG_T::in_width * CONFIG_T::n_filt],
-               data_T res[CONFIG_T::out_height * CONFIG_T::out_width * CONFIG_T::n_filt]){
+               res_T res[CONFIG_T::out_height * CONFIG_T::out_width * CONFIG_T::n_filt]){
 
   // TODO partition the arrays according to the reuse factor
   const int limit = pool_op_limit<CONFIG_T>();

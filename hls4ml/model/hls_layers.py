@@ -17,16 +17,27 @@ class Quantizer(object):
 class IntegerPrecisionType(object):
     def __init__(self, width=16, signed=True):
         self.width = width
+        self.integer = width
+        self.fractional = 0
         self.signed = signed
     
     def __str__(self):
         typestring = 'ap_{signed}int<{width}>'.format(signed='u' if not self.signed else '', width=self.width)
         return typestring
 
+    def __eq__(self, other):
+        eq = self.width == other.width
+        eq = eq and self.signed == other.signed
+        # These are probably unnecessary
+        eq = eq and self.integer == other.integer
+        eq = eq and self.fractional == other.fractional
+        return eq
+
 class FixedPrecisionType(object):
     def __init__(self, width=16, integer=6, signed=True, rounding_mode=None, saturation_mode=None, saturation_bits=None):
         self.width = width
         self.integer = integer
+        self.fractional = width-integer
         self.signed = signed
         self.rounding_mode = rounding_mode
         self.saturation_mode = saturation_mode
@@ -37,6 +48,30 @@ class FixedPrecisionType(object):
         args = ','.join([str(arg) for arg in args if arg is not None])
         typestring = 'ap_{signed}fixed<{args}>'.format(signed='u' if not self.signed else '', args=args)
         return typestring
+
+    def __eq__(self, other):
+        eq = self.width == other.width
+        eq = eq and self.integer == other.integer
+        eq = eq and self.fractional == other.fractional
+        eq = eq and self.signed == other.signed
+        eq = eq and self.rounding_mode == other.rounding_mode
+        eq = eq and self.saturation_mode == other.saturation_mode
+        eq = eq and self.saturation_bits == other.saturation_bits
+        return eq
+
+class XnorPrecisionType(IntegerPrecisionType):
+    '''
+    Convenience class to differentiate 'regular' integers from BNN Xnor ones
+    '''
+    def __init__(self):
+        super().__init__(width=1, signed=False)
+
+class ExponentPrecisionType(IntegerPrecisionType):
+    '''
+    Convenience class to differentiate 'regular' integers from those which represent exponents, for QKeras po2 quantizers, for example.
+    '''
+    def __init__(self, width=16, signed=True):
+        super().__init__(width=width, signed=signed)
 
 def find_minimum_width(data, signed=True):
     """
@@ -80,15 +115,40 @@ class CompressedType(HLSType):
                '{precision} weight; }} {name};\n')
         return cpp_fmt.format(name=self.name, index=self.index_precision, precision=self.precision)
 
+class ExponentType(HLSType):
+    def __init__(self, name, precision, **kwargs):
+        super(ExponentType, self).__init__('exponent_type{index}', precision, **kwargs)
+
+    def definition_cpp(self):
+        cpp_fmt = ('typedef struct {name} {{ '
+                   '{sign} sign; '
+                   '{precision} weight; }} {name};\n')
+        return cpp_fmt.format(name=self.name, precision=self.precision, sign=str(XnorPrecisionType()))
+
+class PackedType(HLSType):
+    def __init__(self, name, precision, n_elem, n_pack, **kwargs):
+        super(PackedType, self).__init__(name, precision, **kwargs)
+        self.n_elem = n_elem
+        if n_pack < 0:
+            self.n_pack = -n_pack
+            self.unpack = True
+        else:
+            self.n_pack = n_pack
+            self.unpack = False
+
+    def definition_cpp(self):
+        n_elem_expr = '/' if self.unpack else '*'
+        return 'typedef nnet::array<{precision}, {n_elem}> {name};\n'.format(name=self.name, precision=self.precision, n_elem=str(self.n_elem) + n_elem_expr + str(self.n_pack))
+
 class Variable(object):
-    def __init__(self, var_name, type_name, precision, **kwargs):
+    def __init__(self, var_name, atype, **kwargs):
         self.name = var_name.format(**kwargs)
-        self.type = HLSType(type_name, precision, **kwargs)
+        self.type = atype
         self.cppname = re.sub(r'\W|^(?=\d)','_', self.name)
 
 class ArrayVariable(Variable):
     def __init__(self, shape, dim_names, var_name='layer{index}', type_name='layer{index}_t', precision=None, pragma='partition', **kwargs):
-        super(ArrayVariable, self).__init__(var_name, type_name, precision, **kwargs)
+        super(ArrayVariable, self).__init__(var_name, HLSType(type_name, precision, **kwargs), **kwargs)
         self.shape = shape
         self.dim_names = dim_names
         self.pragma = pragma
@@ -99,6 +159,31 @@ class ArrayVariable(Variable):
     def definition_cpp(self):
         array_shape = self.size_cpp()
         return '{type} {name}[{shape}]'.format(type=self.type.name, name=self.cppname, shape=array_shape)
+
+    def size(self):
+        nelem = 1
+        for dim in self.shape:
+            nelem *= dim
+        return nelem
+
+    def size_cpp(self):
+        return '*'.join([str(k) for k in self.dim_names])
+
+class StreamVariable(Variable):
+    def __init__(self, shape, dim_names, var_name='layer{index}', type_name='layer{index}_t', precision=None, n_pack=1, depth=0, **kwargs):
+        super(StreamVariable, self).__init__(var_name, PackedType(type_name, precision, shape[-1], n_pack, **kwargs), **kwargs)
+        self.shape = shape
+        self.dim_names = dim_names
+        if depth == 0:
+            depth = np.prod(shape) // shape[-1]
+        self.pragma = ('stream', depth)
+
+    def get_shape(self):
+        return zip(self.dim_names, self.shape)
+
+    #def definition_cpp(self):
+    #    array_shape = self.size_cpp()
+    #    return '{type} {name}[{shape}]'.format(type=self.type.name, name=self.cppname, shape=array_shape)
 
     def size(self):
         nelem = 1
@@ -128,7 +213,7 @@ class InplaceVariable():
 
 class WeightVariable(Variable):
     def __init__(self, var_name, type_name, precision, data, quantizer=None, **kwargs):
-        super(WeightVariable, self).__init__(var_name, type_name, precision, **kwargs)
+        super(WeightVariable, self).__init__(var_name, HLSType(type_name, precision, **kwargs), **kwargs)
         self.data = data
         self.nzeros = -1
         self.shape = list(self.data.shape)
@@ -227,6 +312,36 @@ class CompressedWeightVariable(WeightVariable):
 
     next = __next__
 
+class ExponentWeightVariable(WeightVariable):
+    def __init__(self, var_name, type_name, precision, data, quantizer, **kwargs):
+        super(ExponentWeightVariable, self).__init__(var_name, type_name, precision, data, quantizer, **kwargs)
+        '''
+        WeightVariable for Exponent aka po2 data. The data should already by quantized by the quantizer.
+        '''
+        self.type = ExponentType(type_name, precision, **kwargs)
+        self.shape = list(self.data.shape[:-1])
+
+    def _format(self):
+        y = self.data
+        # Use an XnorBinary-like representation for the sign
+        sign = np.where(y < 0, np.zeros_like(y), np.ones_like(y))
+        # Take the logarithm, since this is what we will write to the header
+        # for the optimized product using shifts
+        y = (np.log2(np.abs(y)) / np.log2(2.)).astype('int')
+        return np.stack((sign, y), axis=-1)
+
+    def __iter__(self):
+        data = self._format()
+        self._iterator = iter(data.reshape((np.product(data.shape[:-1]), 2)))
+        return self
+
+    def __next__(self):
+        value = next(self._iterator)
+        value_fmt = self.precision_fmt % value[1]
+        return '{%d, %s}' % (value[0], value_fmt)
+
+    next = __next__
+
 class Layer(object):
     def __init__(self, model, name, attributes, inputs, outputs=None):
         self.model = model
@@ -245,9 +360,24 @@ class Layer(object):
         self.weights = OrderedDict()
         self.variables = OrderedDict()
         self.precision = OrderedDict()
-        accum_t = HLSType(*reversed(self.model.config.get_precision(self, 'accum')))
+
+        # We set 'accum' precision to match input tensor's precision if 'accum' was not explicitly set
+        def_type_obj, _ = self.model.config.get_precision(self, 'default')
+        acc_type_obj, acc_type_name = self.model.config.get_precision(self, 'accum')
+
+        inp = self.get_input_variable()
+        if inp is not None:
+            inp_type_obj = inp.type.precision
+        else:
+            inp_type_obj = def_type_obj
+
+        if acc_type_obj == def_type_obj: # 'accum' precision not defined in config
+            acc_type_obj = inp_type_obj # use input tensor's precision for 'accum'
+
+        accum_t = HLSType(acc_type_name, acc_type_obj) 
         self.precision[accum_t.name] = accum_t
         self.set_attr('accum_t', accum_t.precision)
+
         self.reuse_factor = self.model.config.get_reuse_factor(self)
 
         layer_config = self.model.config.get_layer_config(self)
@@ -306,6 +436,17 @@ class Layer(object):
         if precision is None:
             precision, _ = self.model.config.get_precision(self, var='result')
 
+        if self.model.config.get_config_value('IOType') == 'io_stream':
+            out = self.make_stream_variable(shape, dim_names, var_name=var_name, type_name=type_name, precision=precision)
+        else:
+            out = self.make_array_variable(shape, dim_names, var_name=var_name, type_name=type_name, precision=precision, pragma=pragma)
+
+        self.variables[out_name] = out
+        self.model.register_output_variable(out_name, out)
+
+        self.precision[out.type.name] = out.type
+
+    def make_array_variable(self, shape, dim_names, var_name='layer{index}_out', type_name='layer{index}_t', precision=None, pragma='auto'):
         if pragma == 'auto':
             if self.model.config.get_config_value('IOType') == 'io_serial':
                 pragma = 'stream'
@@ -315,12 +456,12 @@ class Layer(object):
                 else:
                     pragma = 'partition'
 
-        out = ArrayVariable(shape, dim_names, var_name=var_name, type_name=type_name, precision=precision, pragma=pragma, index=self.index)
+        return ArrayVariable(shape, dim_names, var_name=var_name, type_name=type_name, precision=precision, pragma=pragma, index=self.index)
 
-        self.variables[out_name] = out
-        self.model.register_output_variable(out_name, out)
-
-        self.precision[out.type.name] = out.type
+    def make_stream_variable(self, shape, dim_names, var_name='layer{index}_out', type_name='layer{index}_t', precision=None, depth=0):
+        pack_factor = self.model.config.get_layer_config_value(self, 'PackFactor', default=1)
+        
+        return StreamVariable(shape, dim_names, var_name=var_name, type_name=type_name, precision=precision, n_pack=pack_factor, depth=depth, index=self.index)
 
     def add_weights(self, quantizer=None, compression=False):
         data = self.model.get_weights_data(self.name, 'kernel')
@@ -359,17 +500,22 @@ class Layer(object):
             data = self.model.get_weights_data(self.name, data)
 
         data_unquantized = data
+        exponent_type = False
         if quantizer is not None:
             precision = quantizer.hls_type
             type_name = name + '{index}_t'
             data = quantizer(data)
+            if isinstance(quantizer.hls_type, ExponentPrecisionType):
+                exponent_type = True
 
         if compression:
             var = CompressedWeightVariable(var_name, type_name=type_name, precision=precision, quantizer=quantizer, data=data, reuse_factor=self.reuse_factor, index=self.index)
+        elif exponent_type:
+            var = ExponentWeightVariable(var_name, type_name=type_name, precision=precision, quantizer=quantizer, data=data, index=self.index)
         else:
             var = WeightVariable(var_name, type_name=type_name, precision=precision, quantizer=quantizer, data=data, index=self.index)
 
-            var.data_unquantized = data_unquantized
+        var.data_unquantized = data_unquantized
         self.weights[name] = var
         self.precision[var.type.name] = var.type
 
@@ -468,7 +614,7 @@ class Dense(Layer):
             if compression:
                 self.set_attr('strategy', 'compressed')
             else:
-                self.set_attr('strategy', 'large')
+                self.set_attr('strategy', 'resource')
         else:
             self.set_attr('strategy', 'latency')
         self.add_output_variable(shape, dims)
@@ -480,12 +626,12 @@ class Dense(Layer):
             else:
                 if self.model.config.backend.name == 'Vivado':
                     self.weights['weight'].data = np.transpose(self.weights['weight'].data)
+                    
         self.set_attr('index_t', index_t)
         self.add_bias(quantizer=self.get_attr('bias_quantizer'))
 
     def function_cpp(self):
         params = self._default_function_params()
-        params['strategy'] = self.get_attr('strategy')
         params['w'] = self.get_weights('weight').name
         params['b'] = self.get_weights('bias').name
 
@@ -497,32 +643,33 @@ class Dense(Layer):
         params['n_out'] = self.get_output_variable().size_cpp()
         params['nzeros'] = self.get_weights('weight').nzeros
         params['nonzeros'] = self.get_weights('weight').nonzeros
+        params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('weight').type.precision)
+        params['strategy'] = self.get_attr('strategy')
 
         return self._config_template.format(**params)
 
 class Conv1D(Layer):
     def initialize(self):
         if self.get_attr('data_format') == 'channels_last':
-            shape = [self.attributes['n_out'], self.attributes['n_filt']]
+            shape = [self.attributes['out_width'], self.attributes['n_filt']]
             dims = ['N_OUTPUTS_{}'.format(self.index), 'N_FILT_{}'.format(self.index)]
         else:
-            shape = [self.attributes['n_filt'], self.attributes['n_out']]
+            shape = [self.attributes['n_filt'], self.attributes['out_width']]
             dims = ['N_FILT_{}'.format(self.index), 'N_OUTPUTS_{}'.format(self.index)]
 
         self.add_output_variable(shape, dims)
         self.add_weights(quantizer = self.get_attr('weight_quantizer'))
         self.add_bias(quantizer = self.get_attr('bias_quantizer'))
         if self.model.config.is_resource_strategy(self):
-            self.set_attr('strategy', 'large')
+            self.set_attr('strategy', 'resource')
             if self.model.config.backend.name == 'Vivado':
                 self.model.config.backend.set_closest_reuse_factor(self)
-                self.weights['weight'].data = np.transpose(self.weights['weight'].data, axes=[2, 1, 0]) #(W,C,F) => (F,C,W)
+                self.weights['weight'].data = np.transpose(self.weights['weight'].data, axes=[2, 0, 1]) #(W,C,F) => (F,W,C)
         else:
             self.set_attr('strategy', 'latency')
 
     def function_cpp(self):
         params = self._default_function_params()
-        params['strategy'] = self.get_attr('strategy')
         params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
         params['w'] = self.get_weights('weight').name
         params['b'] = self.get_weights('bias').name
@@ -540,22 +687,156 @@ class Conv1D(Layer):
             params['n_chan'] = input_dims[0]
         params['dilation'] = self.get_attr('dilation', 1)
         params['n_filt'] = 'N_FILT_{}'.format(self.index)
-        params['n_out'] = 'N_OUTPUTS_{}'.format(self.index)
+        params['out_width'] = 'N_OUTPUTS_{}'.format(self.index)
         params['nzeros'] = self.get_weights('weight').nzeros
-        params['config_t'] = 'std::nullptr_t'
 
-        if self.model.config.is_resource_strategy(self):
-            params['config_t'] = 'config{}_mult'.format(self.index)
-            conv_config = self._config_template[0].format(**params)
-
-            mult_params = self._default_config_params()
-            mult_params['n_in'] = self.get_attr('n_chan') * self.get_attr('filt_width')
-            mult_params['n_out'] = self.get_attr('n_filt')
-            mult_config = self._config_template[1].format(**mult_params)
-
-            return mult_config + '\n' + conv_config
+        if self.model.config.get_config_value('IOType') == 'io_stream':
+            min_w, instructions = self.model.config.backend.compute_conv1d_instructions(
+                self.get_input_variable().shape[0],
+                self.get_input_variable().shape[1],
+                params['filt_width'],
+                params['stride_width'])
+            instructions_str = ','.join(str(i) for i in instructions)
+            params['min_width'] = min_w
+            params['instructions'] = instructions_str
         else:
-            return self._config_template[0].format(**params)
+            params['min_width'] = params['n_in']
+            params['instructions'] = '0'
+
+        params['config_t'] = 'config{}_mult'.format(self.index)
+        conv_config = self._config_template[0].format(**params)
+
+        mult_params = self._default_config_params()
+        mult_params['n_in'] = self.get_attr('n_chan') * self.get_attr('filt_width')
+        mult_params['n_out'] = self.get_attr('n_filt')
+        mult_params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('weight').type.precision)
+        mult_config = self._config_template[1].format(**mult_params)
+
+        return mult_config + '\n' + conv_config
+
+class SeparableConv1D(Layer):
+    def initialize(self):
+        if self.get_attr('data_format') == 'channels_last':
+            shape = [self.attributes['out_width'], self.attributes['n_filt']]
+            dims = ['N_OUTPUTS_{}'.format(self.index), 'N_FILT_{}'.format(self.index)]
+        else:
+            shape = [self.attributes['n_filt'], self.attributes['out_width']]
+            dims = ['N_FILT_{}'.format(self.index), 'N_OUTPUTS_{}'.format(self.index)]
+        self.add_output_variable(shape, dims)
+        
+        depthwise_data = self.model.get_weights_data(self.name, 'depthwise_kernel')
+        pointwise_data = self.model.get_weights_data(self.name, 'pointwise_kernel')
+
+        self.add_weights_variable(name='depthwise', var_name='d{index}', data=depthwise_data, quantizer=self.get_attr('depthwise_quantizer'))
+        self.add_weights_variable(name='pointwise', var_name='p{index}', data=pointwise_data, quantizer=self.get_attr('pointwise_quantizer'))
+        
+        zero_bias_data = np.zeros((self.attributes['n_chan'],))
+        self.add_weights_variable(name='zero_bias', var_name='z{index}', data=zero_bias_data)
+
+        self.add_bias(quantizer=self.get_attr('bias_quantizer'))
+        if self.model.config.is_resource_strategy(self):
+            self.set_attr('strategy', 'resource')
+            if self.model.config.backend.name == 'Vivado':
+                self.model.config.backend.set_closest_reuse_factor(self)
+                self.weights['depthwise'].data = np.transpose(self.weights['depthwise'].data, axes=[2, 0, 1]) #(W,C,F) => (F,W,C)
+                self.weights['pointwise'].data = np.transpose(self.weights['pointwise'].data, axes=[2, 0, 1]) #(W,C,F) => (F,W,C)
+        else:
+            self.set_attr('strategy', 'latency')
+
+    def function_cpp(self):
+        params = self._default_function_params()
+        params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
+        params['d'] = self.get_weights('depthwise').name
+        params['p'] = self.get_weights('pointwise').name
+        params['b'] = self.get_weights('bias').name
+        params['z'] = self.get_weights('zero_bias').name
+
+        return [self._function_template.format(**params)]
+
+    def config_cpp(self):
+        # Separable master config
+        params = {}
+        params['index'] = self.index
+        params['depthwise_config'] = 'config{}_depthwise'.format(self.index)
+        params['pointwise_config'] = 'config{}_pointwise'.format(self.index)
+        sep_config = self._config_template[0].format(**params)
+
+        # Depthwise config
+        params = self._default_config_params()
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_width'] = self.get_input_variable().dim_names[0]
+            params['n_chan'] = self.get_input_variable().dim_names[1]
+            params['out_width'] = self.get_output_variable().dim_names[0]
+            params['n_filt'] = self.get_input_variable().dim_names[1]
+        else:
+            params['n_chan'] = self.get_input_variable().dim_names[0]
+            params['in_width'] = self.get_input_variable().dim_names[1]
+            params['n_filt'] = self.get_input_variable().dim_names[0]
+            params['out_width'] = self.get_output_variable().dim_names[1]
+
+        params['dilation'] = self.get_attr('dilation', 1)
+        params['nzeros'] = self.get_weights('depthwise').nzeros
+        params['index'] = str(self.index) + '_depthwise'
+        params['weight_t'] = self.get_weights('depthwise').type.name
+
+        if self.model.config.get_config_value('IOType') == 'io_stream':
+            min_w, instructions = self.model.config.backend.compute_conv1d_instructions(
+                self.get_input_variable().shape[0],
+                self.get_input_variable().shape[1],
+                params['filt_width'],
+                params['stride_width'])
+            instructions_str = ','.join(str(i) for i in instructions)
+            params['min_width'] = min_w
+            params['instructions'] = instructions_str
+        else:
+            params['min_width'] = params['in_width']
+            params['instructions'] = '0'
+
+        params['config_t'] = 'config{}_depthwise_mult'.format(self.index)
+        depthwise_config = self._config_template[1].format(**params)
+
+        # Depthwise mult config
+        mult_params = self._default_config_params()
+        mult_params['index'] = str(self.index) + '_depthwise'
+        mult_params['n_in'] = self.get_attr('n_chan') * self.get_attr('filt_width')
+        mult_params['n_out'] = self.get_attr('n_chan')
+        mult_params['weight_t'] = self.get_weights('depthwise').type.name
+        mult_params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('depthwise').type.precision)
+        depthwise_mult_config = self._config_template[3].format(**mult_params)
+
+        # Pointwise config
+        params = self._default_config_params()
+        input_dims = self.get_input_variable().dim_names
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_width'] = '*'.join([str(k) for k in input_dims[:-1]])
+            params['n_chan'] = input_dims[-1]
+        else:
+            params['in_width'] = '*'.join([str(k) for k in input_dims[1:]])
+            params['n_chan'] = input_dims[0]
+        
+        params['filt_width'] = 1
+        params['dilation'] = self.get_attr('dilation', 1)
+        params['n_filt'] = 'N_FILT_{}'.format(self.index)
+        params['out_width'] = 'N_OUTPUTS_{}'.format(self.index)
+        params['nzeros'] = self.get_weights('pointwise').nzeros
+        params['index'] = str(self.index) + '_pointwise'
+        params['weight_t'] = self.get_weights('pointwise').type.name
+        params['min_width'] = params['in_width']
+        params['instructions'] = '0'
+
+        params['config_t'] = 'config{}_pointwise_mult'.format(self.index)
+        pointwise_config = self._config_template[2].format(**params)
+
+        # Pointwise mult config
+        mult_params = self._default_config_params()
+        mult_params['index'] = str(self.index) + '_pointwise'
+        mult_params['n_in'] = self.get_attr('n_chan')
+        mult_params['n_out'] = self.get_attr('n_filt')
+        mult_params['weight_t'] = self.get_weights('pointwise').type.name
+        mult_params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('pointwise').type.precision)
+        pointwise_mult_config = self._config_template[4].format(**mult_params)
+
+        return depthwise_mult_config + '\n' + depthwise_config + '\n' + pointwise_mult_config + '\n' + pointwise_config + '\n' + sep_config
 
 class Conv2D(Layer):
     def initialize(self):
@@ -569,16 +850,15 @@ class Conv2D(Layer):
         self.add_weights(quantizer=self.get_attr('weight_quantizer'))
         self.add_bias(quantizer=self.get_attr('bias_quantizer'))
         if self.model.config.is_resource_strategy(self):
-            self.set_attr('strategy', 'large')
+            self.set_attr('strategy', 'resource')
             if self.model.config.backend.name == 'Vivado':
                 self.model.config.backend.set_closest_reuse_factor(self)
-                self.weights['weight'].data = np.transpose(self.weights['weight'].data, axes=[3, 2, 0, 1]) #(H,W,C,F) => (F,C,H,W)
+                self.weights['weight'].data = np.transpose(self.weights['weight'].data, axes=[3, 0, 1, 2]) #(H,W,C,F) => (F,H,W,C)
         else:
             self.set_attr('strategy', 'latency')
 
     def function_cpp(self):
         params = self._default_function_params()
-        params['strategy'] = self.get_attr('strategy')
         params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
         params['w'] = self.get_weights('weight').name
         params['b'] = self.get_weights('bias').name
@@ -603,27 +883,315 @@ class Conv2D(Layer):
             params['out_width'] = self.get_output_variable().dim_names[2]
         params['dilation'] = self.get_attr('dilation', 1)
         params['nzeros'] = self.get_weights('weight').nzeros
-        params['config_t'] = 'std::nullptr_t'
 
-        if self.model.config.is_resource_strategy(self):
-            params['config_t'] = 'config{}_mult'.format(self.index)
-            conv_config = self._config_template[0].format(**params)
-
-            mult_params = self._default_config_params()
-            mult_params['n_in'] = self.get_attr('n_chan') * self.get_attr('filt_height') * self.get_attr('filt_width')
-            mult_params['n_out'] = self.get_attr('n_filt')
-            mult_config = self._config_template[1].format(**mult_params)
-
-            return mult_config + '\n' + conv_config
+        if self.model.config.get_config_value('IOType') == 'io_stream':
+            min_h, min_w, instructions = self.model.config.backend.compute_conv2d_instructions(
+                self.get_input_variable().shape[0],
+                self.get_input_variable().shape[1],
+                self.get_input_variable().shape[2],
+                params['filt_height'],
+                params['stride_height'])
+            instructions_str = ','.join(str(i) for i in instructions)
+            params['min_height'] = min_h
+            params['min_width'] = min_w
+            params['instructions'] = instructions_str
         else:
-            return self._config_template[0].format(**params)
+            params['min_height'] = params['in_height']
+            params['min_width'] = params['in_width']
+            params['instructions'] = '0'
+
+        params['config_t'] = 'config{}_mult'.format(self.index)
+        conv_config = self._config_template[0].format(**params)
+
+        mult_params = self._default_config_params()
+        mult_params['n_in'] = self.get_attr('n_chan') * self.get_attr('filt_height') * self.get_attr('filt_width')
+        mult_params['n_out'] = self.get_attr('n_filt')
+        mult_params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('weight').type.precision)
+        mult_config = self._config_template[1].format(**mult_params)
+
+        return mult_config + '\n' + conv_config
+
+
+class Conv2DBatchnorm(Conv2D):
+    def _get_folded_weights(self):
+        """
+        Function to get the batchnorm folded weights.
+        This function converts the weights by folding batchnorm parameters into
+        the weight of QConv2D. The high-level equation:
+        W_fold = gamma * W / sqrt(variance + epsilon)
+        bias_fold = gamma * (bias - moving_mean) / sqrt(variance + epsilon) + beta
+        """
+        kernel = self.model.get_weights_data(self.name, 'kernel')
+        bias = self.model.get_weights_data(self.name, 'bias')
+        if bias is None:
+            bias = 0
+
+        # get batchnorm weights and moving stats
+        gamma = self.model.get_weights_data(self.name, 'gamma')
+        beta = self.model.get_weights_data(self.name, 'beta')
+        moving_mean = self.model.get_weights_data(self.name, 'moving_mean')
+        moving_variance = self.model.get_weights_data(self.name, 'moving_variance')
+        # get the inversion factor so that we replace division by multiplication
+        inv = np.reciprocal(np.sqrt(moving_variance + self.get_attr('epsilon')))
+        if gamma is not None:
+            inv *= gamma
+
+        # wrap conv kernel and bias with bn parameters
+        folded_kernel = inv * kernel
+        folded_bias = inv * (bias - moving_mean) + beta
+
+        return [folded_kernel, folded_bias]
+
+    def initialize(self):
+        super(Conv2DBatchnorm, self).initialize()
+        folded_weights, folded_bias = self._get_folded_weights()
+        if self.model.config.is_resource_strategy(self) and self.model.config.backend.name == 'Vivado':
+            self.weights['weight'].data_unquantized = np.transpose(folded_weights, axes=[3, 0, 1, 2])
+            self.weights['weight'].data = self.get_attr('weight_quantizer')(self.weights['weight'].data_unquantized)
+
+        else:
+            self.weights['weight'].data_unquantized = folded_weights
+            self.weights['weight'].data = self.get_attr('weight_quantizer')(folded_weights)
+        self.weights['bias'].data_unquantized = folded_bias
+        bias_q = self.get_attr('bias_quantizer')
+        if bias_q is not None:
+            self.weights['bias'].data = bias_q(folded_bias)
+
+    def function_cpp(self):
+        return super(Conv2DBatchnorm, self).function_cpp()
+
+    def config_cpp(self):
+        return super(Conv2DBatchnorm, self).config_cpp()
+
+class SeparableConv2D(Layer):
+    def initialize(self):
+        if self.get_attr('data_format') == 'channels_last':
+            shape = [self.attributes['out_height'], self.attributes['out_width'], self.attributes['n_filt']]
+            dims = ['OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index), 'N_FILT_{}'.format(self.index)]
+        else:
+            shape = [self.attributes['n_filt'], self.attributes['out_height'], self.attributes['out_width']]
+            dims = ['N_FILT_{}'.format(self.index), 'OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index)]
+        self.add_output_variable(shape, dims)
+        
+        depthwise_data = self.model.get_weights_data(self.name, 'depthwise_kernel')
+        pointwise_data = self.model.get_weights_data(self.name, 'pointwise_kernel')
+
+        self.add_weights_variable(name='depthwise', var_name='d{index}', data=depthwise_data, quantizer=self.get_attr('depthwise_quantizer'))
+        self.add_weights_variable(name='pointwise', var_name='p{index}', data=pointwise_data, quantizer=self.get_attr('pointwise_quantizer'))
+        
+        zero_bias_data = np.zeros((self.attributes['n_chan'],))
+        self.add_weights_variable(name='zero_bias', var_name='z{index}', data=zero_bias_data)
+
+        self.add_bias(quantizer=self.get_attr('bias_quantizer'))
+        if self.model.config.is_resource_strategy(self):
+            self.set_attr('strategy', 'resource')
+            if self.model.config.backend.name == 'Vivado':
+                self.model.config.backend.set_closest_reuse_factor(self)
+                self.weights['depthwise'].data = np.transpose(self.weights['depthwise'].data, axes=[3, 0, 1, 2]) #(H,W,C,F) => (F,H,W,C)
+                self.weights['pointwise'].data = np.transpose(self.weights['pointwise'].data, axes=[3, 0, 1, 2]) #(H,W,C,F) => (F,H,W,C)
+        else:
+            self.set_attr('strategy', 'latency')
+
+    def function_cpp(self):
+        params = self._default_function_params()
+        params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
+        params['d'] = self.get_weights('depthwise').name
+        params['p'] = self.get_weights('pointwise').name
+        params['b'] = self.get_weights('bias').name
+        params['z'] = self.get_weights('zero_bias').name
+
+        return [self._function_template.format(**params)]
+
+    def config_cpp(self):
+        # Separable master config
+        params = {}
+        params['index'] = self.index
+        params['depthwise_config'] = 'config{}_depthwise'.format(self.index)
+        params['pointwise_config'] = 'config{}_pointwise'.format(self.index)
+        sep_config = self._config_template[0].format(**params)
+
+        # Depthwise config
+        params = self._default_config_params()
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_height'] = self.get_input_variable().dim_names[0]
+            params['in_width'] = self.get_input_variable().dim_names[1]
+            params['n_chan'] = self.get_input_variable().dim_names[2]
+            params['out_height'] = self.get_output_variable().dim_names[0]
+            params['out_width'] = self.get_output_variable().dim_names[1]
+            params['n_filt'] = self.get_input_variable().dim_names[2]
+        else:
+            params['n_chan'] = self.get_input_variable().dim_names[0]
+            params['in_height'] = self.get_input_variable().dim_names[1]
+            params['in_width'] = self.get_input_variable().dim_names[2]
+            params['n_filt'] = self.get_input_variable().dim_names[0]
+            params['out_height'] = self.get_output_variable().dim_names[1]
+            params['out_width'] = self.get_output_variable().dim_names[2]
+
+        params['dilation'] = self.get_attr('dilation', 1)
+        params['nzeros'] = self.get_weights('depthwise').nzeros
+        params['index'] = str(self.index) + '_depthwise'
+        params['weight_t'] = self.get_weights('depthwise').type.name
+
+        if self.model.config.get_config_value('IOType') == 'io_stream':
+            min_h, min_w, instructions = self.model.config.backend.compute_conv2d_instructions(
+                self.get_input_variable().shape[0],
+                self.get_input_variable().shape[1],
+                self.get_input_variable().shape[2],
+                params['filt_height'],
+                params['stride_height'])
+            instructions_str = ','.join(str(i) for i in instructions)
+            params['min_height'] = min_h
+            params['min_width'] = min_w
+            params['instructions'] = instructions_str
+        else:
+            params['min_height'] = params['in_height']
+            params['min_width'] = params['in_width']
+            params['instructions'] = '0'
+
+        params['config_t'] = 'config{}_depthwise_mult'.format(self.index)
+        depthwise_config = self._config_template[1].format(**params)
+
+        # Depthwise mult config
+        mult_params = self._default_config_params()
+        mult_params['index'] = str(self.index) + '_depthwise'
+        mult_params['n_in'] = self.get_attr('n_chan') * self.get_attr('filt_height') * self.get_attr('filt_width')
+        mult_params['n_out'] = self.get_attr('n_chan')
+        mult_params['weight_t'] = self.get_weights('depthwise').type.name
+        mult_params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('depthwise').type.precision)
+        depthwise_mult_config = self._config_template[3].format(**mult_params)
+
+        # Pointwise config
+        params = self._default_config_params()
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_height'] = self.get_output_variable().dim_names[0]
+            params['in_width'] = self.get_output_variable().dim_names[1]
+            params['n_chan'] = self.get_input_variable().dim_names[2]
+            params['out_height'] = self.get_output_variable().dim_names[0]
+            params['out_width'] = self.get_output_variable().dim_names[1]
+            params['n_filt'] = self.get_output_variable().dim_names[2]
+        else:
+            params['n_chan'] = self.get_input_variable().dim_names[0]
+            params['in_height'] = self.get_output_variable().dim_names[1]
+            params['in_width'] = self.get_output_variable().dim_names[2]
+            params['n_filt'] = self.get_output_variable().dim_names[0]
+            params['out_height'] = self.get_output_variable().dim_names[1]
+            params['out_width'] = self.get_output_variable().dim_names[2]
+
+        params['filt_height'] = params['filt_width'] = 1
+        params['dilation'] = self.get_attr('dilation', 1)
+        params['nzeros'] = self.get_weights('pointwise').nzeros
+        params['index'] = str(self.index) + '_pointwise'
+        params['weight_t'] = self.get_weights('pointwise').type.name
+        params['min_height'] = params['in_height']
+        params['min_width'] = params['in_width']
+        params['instructions'] = '0'
+
+        params['config_t'] = 'config{}_pointwise_mult'.format(self.index)
+        pointwise_config = self._config_template[2].format(**params)
+
+        # Pointwise mult config
+        mult_params = self._default_config_params()
+        mult_params['index'] = str(self.index) + '_pointwise'
+        mult_params['n_in'] = self.get_attr('n_chan')
+        mult_params['n_out'] = self.get_attr('n_filt')
+        mult_params['weight_t'] = self.get_weights('pointwise').type.name
+        mult_params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('pointwise').type.precision)
+        pointwise_mult_config = self._config_template[4].format(**mult_params)
+
+        return depthwise_mult_config + '\n' + depthwise_config + '\n' + pointwise_mult_config + '\n' + pointwise_config + '\n' + sep_config
+
+class DepthwiseConv2D(Conv2D):
+    def initialize(self):
+        if self.get_attr('data_format') == 'channels_last':
+            shape = [self.attributes['out_height'], self.attributes['out_width'], self.attributes['n_chan']]
+            dims = ['OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index), 'N_CHAN_{}'.format(self.index)]
+        else:
+            shape = [self.attributes['n_chan'], self.attributes['out_height'], self.attributes['out_width']]
+            dims = ['N_CHAN_{}'.format(self.index), 'OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index)]
+        self.add_output_variable(shape, dims)
+
+        depthwise_data = self.model.get_weights_data(self.name, 'depthwise_kernel')
+        self.add_weights_variable(name='weight', var_name='w{index}', data=depthwise_data, quantizer=self.get_attr('depthwise_quantizer'))
+
+        self.add_bias(quantizer=self.get_attr('bias_quantizer'))
+        if self.model.config.is_resource_strategy(self):
+            self.set_attr('strategy', 'resource')
+            if self.model.config.backend.name == 'Vivado':
+                self.model.config.backend.set_closest_reuse_factor(self)
+                self.weights['weight'].data = np.transpose(self.weights['weight'].data, axes=[3, 0, 1, 2]) #(H,W,C,F) => (F,H,W,C)
+        else:
+            self.set_attr('strategy', 'latency')
 
 class Pooling1D(Layer):
+    def initialize(self):
+        if self.get_attr('data_format') == 'channels_last':
+            shape = [self.attributes['n_out'], self.attributes['n_filt']]
+            dims = ['N_OUTPUTS_{}'.format(self.index), 'N_FILT_{}'.format(self.index)]
+        else:
+            shape = [self.attributes['n_filt'], self.attributes['n_out']]
+            dims = ['N_FILT_{}'.format(self.index), 'N_OUTPUTS_{}'.format(self.index)]
+        self.add_output_variable(shape, dims)
+        self.set_attr('pool_op', self.get_attr('class_name').split('Pooling')[0])
+
+    def function_cpp(self):
+        params = self._default_function_params()
+        params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
+
+        return [self._function_template.format(**params)]
+
+    def config_cpp(self):
+        params = self._default_config_params()
+        if self.get_attr('data_format') == 'channels_last':
+            params['n_in'] = self.get_input_variable().dim_names[0]
+            params['n_out'] = self.get_output_variable().dim_names[0]
+            params['n_filt'] = self.get_output_variable().dim_names[1]
+        else:
+            params['n_in'] = self.get_input_variable().dim_names[1]
+            params['n_out'] = self.get_input_variable().dim_names[1]
+            params['n_filt'] = self.get_output_variable().dim_names[0]
+
+        return self._config_template.format(**params)
+
+class Pooling2D(Layer):
+    def initialize(self):
+        if self.get_attr('data_format') == 'channels_last':
+            shape = [self.attributes['out_height'], self.attributes['out_width'], self.attributes['n_filt']]
+            dims = ['OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index), 'N_FILT_{}'.format(self.index)]
+        else:
+            shape = [self.attributes['n_filt'], self.attributes['out_height'], self.attributes['out_width']]
+            dims = ['N_FILT_{}'.format(self.index), 'OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index)]
+        self.add_output_variable(shape, dims)
+        self.set_attr('pool_op', self.get_attr('class_name').split('Pooling')[0])
+
+    def function_cpp(self):
+        params = self._default_function_params()
+        params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
+
+        return [self._function_template.format(**params)]
+
+    def config_cpp(self):
+        params = self._default_config_params()
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_height'] = self.get_input_variable().dim_names[0]
+            params['in_width'] = self.get_input_variable().dim_names[1]
+            params['out_height'] = self.get_output_variable().dim_names[0]
+            params['out_width'] = self.get_output_variable().dim_names[1]
+            params['n_filt'] = self.get_output_variable().dim_names[2]
+        else:
+            params['in_height'] = self.get_input_variable().dim_names[1]
+            params['in_width'] = self.get_input_variable().dim_names[2]
+            params['n_filt'] = self.get_output_variable().dim_names[0]
+            params['out_height'] = self.get_output_variable().dim_names[1]
+            params['out_width'] = self.get_output_variable().dim_names[2]
+
+        return self._config_template.format(**params)
+
+class GlobalPooling1D(Layer):
     def initialize(self):
         shape = [self.attributes['n_out'], self.attributes['n_filt']]
         dims = ['N_OUTPUTS_{}'.format(self.index), 'N_FILT_{}'.format(self.index)]
         self.add_output_variable(shape, dims)
-        self.set_attr('pool_op', self.get_attr('class_name').split('Pooling')[0])
+        self.set_attr('pool_op', self.get_attr('class_name').split('Pooling')[0].replace('Global', ''))
 
     def function_cpp(self):
         params = self._default_function_params()
@@ -633,16 +1201,15 @@ class Pooling1D(Layer):
     def config_cpp(self):
         params = self._default_config_params()
         params['n_in'] = self.get_input_variable().size_cpp()
-        params['n_out'] = self.get_output_variable().size_cpp()
 
         return self._config_template.format(**params)
 
-class Pooling2D(Layer):
+class GlobalPooling2D(Layer):
     def initialize(self):
-        shape = [self.attributes['out_height'], self.attributes['out_width'], self.attributes['n_filt']]
-        dims = ['OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index), 'N_FILT_{}'.format(self.index)]
+        shape = [self.attributes['n_filt']]
+        dims = ['N_FILT_{}'.format(self.index)]
         self.add_output_variable(shape, dims)
-        self.set_attr('pool_op', self.get_attr('class_name').split('Pooling')[0])
+        self.set_attr('pool_op', self.get_attr('class_name').split('Pooling')[0].replace('Global', ''))
 
     def function_cpp(self):
         params = self._default_function_params()
@@ -651,11 +1218,72 @@ class Pooling2D(Layer):
 
     def config_cpp(self):
         params = self._default_config_params()
-        params['n_in'] = self.get_input_variable().dim_names[0]
-        params['in_width'] = self.get_input_variable().dim_names[1]
-        params['out_height'] = self.get_output_variable().dim_names[0]
-        params['out_width'] = self.get_output_variable().dim_names[1]
-        params['n_filt'] = self.get_output_variable().dim_names[2]
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_height'] = self.get_input_variable().dim_names[0]
+            params['in_width'] = self.get_input_variable().dim_names[1]
+        else:
+            params['in_height'] = self.get_input_variable().dim_names[1]
+            params['in_width'] = self.get_input_variable().dim_names[2]
+
+        return self._config_template.format(**params)
+
+class ZeroPadding1D(Layer):
+    def initialize(self):
+        if self.get_attr('data_format') == 'channels_last':
+            shape = [self.attributes['out_width'], self.attributes['n_chan']]
+            dims = ['OUT_WIDTH_{}'.format(self.index), 'N_CHAN_{}'.format(self.index)]
+        else:
+            shape = [self.attributes['n_chan'], self.attributes['out_width']]
+            dims = ['N_CHAN_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index)]
+        self.add_output_variable(shape, dims)
+
+    def function_cpp(self):
+        params = self._default_function_params()
+        params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
+        return [self._function_template.format(**params)]
+
+    def config_cpp(self):
+        params = self._default_config_params()
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_width'] = self.get_input_variable().dim_names[0]
+            params['n_chan'] = self.get_input_variable().dim_names[1]
+            params['out_width'] = self.get_output_variable().dim_names[0]
+        else:
+            params['n_chan'] = self.get_input_variable().dim_names[0]
+            params['in_width'] = self.get_input_variable().dim_names[1]
+            params['out_width'] = self.get_output_variable().dim_names[1]
+
+        return self._config_template.format(**params)
+
+class ZeroPadding2D(Layer):
+    def initialize(self):
+        if self.get_attr('data_format') == 'channels_last':
+            shape = [self.attributes['out_height'], self.attributes['out_width'], self.attributes['n_chan']]
+            dims = ['OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index), 'N_CHAN_{}'.format(self.index)]
+        else:
+            shape = [self.attributes['n_chan'], self.attributes['out_height'], self.attributes['out_width']]
+            dims = ['N_CHAN_{}'.format(self.index), 'OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index)]
+        self.add_output_variable(shape, dims)
+
+    def function_cpp(self):
+        params = self._default_function_params()
+        params['data_format'] = 'cf' if self.get_attr('data_format') == 'channels_first' else 'cl'
+        return [self._function_template.format(**params)]
+
+    def config_cpp(self):
+        params = self._default_config_params()
+        if self.get_attr('data_format') == 'channels_last':
+            params['in_height'] = self.get_input_variable().dim_names[0]
+            params['in_width'] = self.get_input_variable().dim_names[1]
+            params['n_chan'] = self.get_input_variable().dim_names[2]
+            params['out_height'] = self.get_output_variable().dim_names[0]
+            params['out_width'] = self.get_output_variable().dim_names[1]
+        else:
+            params['n_chan'] = self.get_input_variable().dim_names[0]
+            params['in_height'] = self.get_input_variable().dim_names[1]
+            params['in_width'] = self.get_input_variable().dim_names[2]
+            params['out_height'] = self.get_output_variable().dim_names[1]
+            params['out_width'] = self.get_output_variable().dim_names[2]
 
         return self._config_template.format(**params)
 
@@ -758,6 +1386,7 @@ class BatchNormalization(Layer):
     def config_cpp(self):
         params = self._default_config_params()
         params['n_in'] = self.get_input_variable().size_cpp()
+        params['product_type'] = self.model.config.backend.product_type(self.get_input_variable().type.precision, self.get_weights('scale').type.precision)
 
         return self._config_template.format(**params)
 
@@ -788,6 +1417,26 @@ class Merge(Layer):
         params = self._default_config_params()
         params['n_elem'] = self.get_input_variable(self.inputs[0]).size_cpp()
 
+        return self._config_template.format(**params)
+
+class Dot(Merge):
+    def initialize(self):
+        assert(len(self.inputs) == 2)
+        inp1 = self.get_input_variable(self.inputs[0])
+        inp2 = self.get_input_variable(self.inputs[1])
+        assert(inp1.shape == inp2.shape)
+        if len(inp1.shape) > 1:
+            raise Exception('ERROR: Dot of tensors with rank > 1 is not yet supported.')
+
+        self.add_output_variable(shape=[1], dim_names=['OUT_DOT_{}'.format(self.index)])
+
+    def config_cpp(self):
+        inp1 = self.get_input_variable(self.inputs[0])
+        inp2 = self.get_input_variable(self.inputs[1])
+        params = self._default_config_params()
+        params['n_out'] = 1
+        params['n_in'] = inp1.shape[0]
+        params['product_type'] = self.model.config.backend.product_type(inp1.type.precision, inp2.type.precision)
         return self._config_template.format(**params)
 
 class Concatenate(Merge):
@@ -834,7 +1483,7 @@ class BiasAdd(Merge): # TensorFlow's operator that gets merged into Dense/Conv
 
 class Resize(Layer):
     def initialize(self):
-        shape = [self.get_attr('new_height'), self.get_attr('new_width'), self.get_attr('n_chan')]
+        shape = [self.get_attr('out_height'), self.get_attr('out_width'), self.get_attr('n_chan')]
         dims = ['OUT_HEIGHT_{}'.format(self.index), 'OUT_WIDTH_{}'.format(self.index), 'N_CHAN_{}'.format(self.index)]
         self.add_output_variable(shape, dims)
 
@@ -1144,37 +1793,51 @@ class GarNetStack(GarNet):
         params['sublayer_configs'] = '\n'.join(sublayer_configs)
 
 layer_map = {
-    'InputLayer'         : Input,
-    'Activation'         : Activation,
-    'QActivation'        : Activation,
-    'LeakyReLU'          : ParametrizedActivation,
-    'ThresholdedReLU'    : ParametrizedActivation,
-    'ELU'                : ParametrizedActivation,
-    'PReLU'              : PReLU,
-    'Softmax'            : Softmax,
-    'Reshape'            : Reshape,
-    'Dense'              : Dense,
-    'BinaryDense'        : Dense,
-    'TernaryDense'       : Dense,
-    'QDense'             : Dense,
-    'Conv1D'             : Conv1D,
-    'QConv1D'            : Conv1D,
-    'Conv2D'             : Conv2D,
-    'BinaryConv2D'       : Conv2D,
-    'QConv2D'            : Conv2D,
-    'BatchNormalization' : BatchNormalization,
-    'MaxPooling1D'       : Pooling1D,
-    'AveragePooling1D'   : Pooling1D,
-    'MaxPooling2D'       : Pooling2D,
-    'AveragePooling2D'   : Pooling2D,
-    'Merge'              : Merge,
-    'Concatenate'        : Concatenate,
-    'Resize'             : Resize,
-    'Transpose'          : Transpose,
-    'GarNet'             : GarNet,
-    'GarNetStack'        : GarNetStack,
+    'Input'                  : Input,
+    'InputLayer'             : Input,
+    'Activation'             : Activation,
+    'QActivation'            : Activation,
+    'LeakyReLU'              : ParametrizedActivation,
+    'ThresholdedReLU'        : ParametrizedActivation,
+    'ELU'                    : ParametrizedActivation,
+    'PReLU'                  : PReLU,
+    'Softmax'                : Softmax,
+    'Reshape'                : Reshape,
+    'Dense'                  : Dense,
+    'BinaryDense'            : Dense,
+    'TernaryDense'           : Dense,
+    'QDense'                 : Dense,
+    'Conv1D'                 : Conv1D,
+    'QConv1D'                : Conv1D,
+    'Conv2D'                 : Conv2D,
+    'BinaryConv2D'           : Conv2D,
+    'QConv2D'                : Conv2D,
+    'QConv2DBatchnorm'       : Conv2DBatchnorm,
+    'SeparableConv1D'        : SeparableConv1D,
+    'SeparableConv2D'        : SeparableConv2D,
+    'DepthwiseConv2D'        : DepthwiseConv2D,
+    'BatchNormalization'     : BatchNormalization,
+    'QBatchNormalization'    : BatchNormalization,
+    'MaxPooling1D'           : Pooling1D,
+    'AveragePooling1D'       : Pooling1D,
+    'MaxPooling2D'           : Pooling2D,
+    'AveragePooling2D'       : Pooling2D,
+    'GlobalMaxPooling1D'     : GlobalPooling1D,
+    'GlobalAveragePooling1D' : GlobalPooling1D,
+    'GlobalMaxPooling2D'     : GlobalPooling2D,
+    'GlobalAveragePooling2D' : GlobalPooling2D,
+    'ZeroPadding1D'          : ZeroPadding1D,
+    'ZeroPadding2D'          : ZeroPadding2D,
+    'Merge'                  : Merge,
+    'Dot'                    : Dot,
+    'Concatenate'            : Concatenate,
+    'Resize'                 : Resize,
+    'UpSampling2D'           : Resize,
+    'Transpose'              : Transpose,
+    'GarNet'                 : GarNet,
+    'GarNetStack'            : GarNetStack,
     # TensorFlow-specific layers:
-    'BiasAdd'            : BiasAdd,
+    'BiasAdd'                : BiasAdd,
 }
 
 def register_layer(name, clazz):

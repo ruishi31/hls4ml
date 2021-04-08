@@ -12,7 +12,8 @@ from collections import OrderedDict
 from hls4ml.model.hls_layers import *
 from hls4ml.templates import get_backend
 from hls4ml.writer import get_writer
-from hls4ml.model.optimizer import optimize_model
+from hls4ml.model.optimizer import optimize_model, get_available_passes
+from hls4ml.report.vivado_report import parse_vivado_report
 
 class HLSConfig(object):
     def __init__(self, config):
@@ -106,6 +107,8 @@ class HLSConfig(object):
         if precision is None:
             raise Exception('No precision for {}->{} found and no default specified.'.format(layer.name, var))
 
+        precision = self.backend.convert_precision_string(precision)
+
         return (precision, type_name)
 
     def get_reuse_factor(self, layer):
@@ -143,7 +146,20 @@ class HLSConfig(object):
 
     def _parse_hls_config(self):
         hls_config = self.config['HLSConfig']
+        
         self.optimizers = hls_config.get('Optimizers')
+        if 'SkipOptimizers' in hls_config:
+            if self.optimizers is not None:
+                raise Exception('Invalid optimizer configuration, please use either "Optimizers" or "SkipOptimizers".')
+            skip_optimizers = hls_config.get('SkipOptimizers')
+            selected_optimizers = get_available_passes()
+            for opt in skip_optimizers:
+                try:
+                    selected_optimizers.remove(opt)
+                except ValueError:
+                    pass                
+            self.optimizers = selected_optimizers
+        
         model_cfg = hls_config.get('Model')
         if model_cfg is not None:
             precision_cfg = model_cfg.get('Precision')
@@ -267,6 +283,31 @@ class HLSModel(object):
         optimize_model(self, optimizers)
 
     def make_node(self, kind, name, attributes, inputs, outputs=None):
+        """ Make a new node not connected to the model graph.
+
+        The 'kind' should be a valid layer registered with `register_layer`. If no outputs
+        are specified, a default output named the same as the node will be created. The 
+        returned node should be added to the graph with `insert_node` or `replace_node`
+        functions.
+
+        Args:
+            kind (str): Type of node to add
+            name (str): Name of the node
+            attributes (dict): Initial set of attributes required to construct the node (Layer)
+            inputs (list): List of inputs to the layer
+            outputs (list, optional): The optional list of named outputs of the node
+
+        Raises:
+            Exception: If an attempt to insert a node with multiple inputs is made or if
+                `before` does not specify a correct node in sequence.
+
+        Returns:
+            Layer: The node created.
+        """
+
+        if kind not in layer_map:
+            raise Exception('Layer {} not found in registry.'.format(kind))
+
         node = layer_map[kind](self, name, attributes, inputs, outputs)
         for o in node.outputs:
             out_var = node.get_output_variable(output_name=o)
@@ -276,12 +317,33 @@ class HLSModel(object):
 
         return node
 
-    def insert_node(self, node):
+    def insert_node(self, node, before=None):
+        """ Insert a new node into the model graph.
+
+        The node to be inserted should be created with `make_node()` function. The optional 
+        parameter `before` can be used to specify the node that follows in case of ambiguities.
+
+        Args:
+            node (Layer): Node to insert
+            before (Layer, optional): The next node in sequence before which a
+                new node should be inserted. 
+        Raises:
+            Exception: If an attempt to insert a node with multiple inputs is made or if
+                `before` does not specify a correct node in sequence.
+
+        """
         if len(node.inputs) > 1:
             raise Exception('Cannot insert a node with more than one input (for now).')
 
         prev_node = self.graph.get(node.inputs[0])
-        next_node = next((x for x in self.graph.values() if x.inputs[0] == prev_node.outputs[0]), None)
+        next_nodes = [x for x in self.graph.values() if x.inputs[0] == prev_node.outputs[0]]
+        if before is None:
+            next_node = next((x for x in self.graph.values() if x.inputs[0] == prev_node.outputs[0]), None)
+        else:
+            if before not in next_nodes:
+                raise Exception('Cannot insert a node {} before {} (candidates: {}).'.format(node.name, before.name, ','.join([n.name for n in next_nodes])))
+            next_node = before
+
         if next_node is not None:
             next_node.inputs[0] = node.outputs[0]
 
@@ -294,14 +356,32 @@ class HLSModel(object):
         self.graph = new_graph
 
     def remove_node(self, node, rewire=True):
+        """ Remove a node from a graph.
+
+        By default, this function can connect the outputs of previous node to the input of next one.
+        Note that when removing a leaf node `rewire` should be set to `False`.
+
+        Args:
+            node (Layer): The node to remove
+            rewire (bool, optional): If `True`, connects the outputs of the previous node
+                to the inputs of the next node
+
+        Raises:
+            Exception: If an attempt is made to rewire a leaf node or a node with multiple
+                inputs/outpus.
+
+        """
         if rewire:
             if len(node.inputs) > 1 or len(node.outputs) > 1:
                 raise Exception('Cannot rewire a node with multiple inputs/outputs')
             prev_node = self.graph.get(node.inputs[0])
-            next_node = next((x for x in self.graph.values() if x.inputs[0] == node.outputs[0]), None)
+            next_node = next((x for x in self.graph.values() if node.outputs[0] in x.inputs), None)
             if prev_node is not None:
                 if next_node is not None:
-                    next_node.inputs[0] = prev_node.outputs[0]
+                    for i,_ in enumerate(next_node.inputs):
+                        if node.outputs[0] == next_node.inputs[i]:
+                            next_node.inputs[i] = prev_node.outputs[0]
+                            break
                 else:
                     if node.outputs[0] in self.outputs:
                         self.outputs = [prev_node.outputs[0] if x == node.outputs[0] else x for x in self.outputs]
@@ -314,6 +394,13 @@ class HLSModel(object):
         del self.graph[node.name]
 
     def replace_node(self, old_node, new_node):
+        """ Replace an existing node in the graph with a new one.
+
+        Args:
+            old_node (Layer): The node to replace
+            new_node (Layer): The new node
+
+        """
         prev_node = self.graph.get(old_node.inputs[0])
         next_node = next((x for x in self.graph.values() if x.inputs[0] == old_node.outputs[0]), None)
         if next_node is not None:
@@ -352,9 +439,17 @@ class HLSModel(object):
         return variables
 
     def get_layer_output_variable(self, output_name):
-        return self.output_vars[output_name]
+        return self.output_vars.get(output_name, None)
 
     def write(self):
+        def make_stamp():
+            from string import hexdigits
+            from random import choice
+            length = 8
+            return ''.join(choice(hexdigits) for m in range(length))
+        
+        self.config.config['Stamp'] = make_stamp()
+
         self.config.writer.write_hls(self)
 
     def compile(self):
@@ -367,7 +462,7 @@ class HLSModel(object):
             ret_val = os.system('bash build_lib.sh')
             if ret_val != 0:
                 raise Exception('Failed to compile project "{}"'.format(self.config.get_project_name()))
-            lib_name = 'firmware/{}.so'.format(self.config.get_project_name())
+            lib_name = 'firmware/{}-{}.so'.format(self.config.get_project_name(), self.config.get_config_value('Stamp'))
             if self._top_function_lib is not None:
 
                 if platform.system() == "Linux":
@@ -460,7 +555,7 @@ class HLSModel(object):
         layer_sizes = {}
         n_traced = 0
         for layer in self.get_layers():
-            if layer.function_cpp() and self.config.get_layer_config_value(layer, 'Trace', False):
+            if layer.function_cpp() and layer.get_attr('Trace', False):
                 n_traced += len(layer.get_variables())
                 trace_output[layer.name] = []
                 layer_sizes[layer.name] = layer.get_output_variable().shape
@@ -519,7 +614,7 @@ class HLSModel(object):
             backend = self.config.get_config_value('Backend', 'Vivado')
             if backend == 'Vivado':
                 found = os.system('command -v vivado_hls > /dev/null')
-                if found is not 0:
+                if found != 0:
                     raise Exception('Vivado HLS installation not found. Make sure "vivado_hls" is on PATH.')
 
             elif backend == 'Intel':
@@ -538,4 +633,6 @@ class HLSModel(object):
         os.system('vivado_hls -f build_prj.tcl "reset={reset} csim={csim} synth={synth} cosim={cosim} validation={validation} export={export} vsynth={vsynth}"'
             .format(reset=reset, csim=csim, synth=synth, cosim=cosim, validation=validation, export=export, vsynth=vsynth))
         os.chdir(curr_dir)
+
+        return parse_vivado_report(self.config.get_output_dir())
 

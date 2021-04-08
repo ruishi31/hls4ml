@@ -1,5 +1,5 @@
 <p float="left">
-   <img src="https://hls-fpga-machine-learning.github.io/hls4ml/img/logo.jpg" alt="hls4ml" width="400"/>
+   <img src="https://fastmachinelearning.github.io/hls4ml/img/logo.jpg" alt="hls4ml" width="400"/>
 </p>
 
 [![DOI](https://zenodo.org/badge/108329371.svg)](https://zenodo.org/badge/latestdoi/108329371)
@@ -14,7 +14,7 @@ A package for machine learning inference in FPGAs. We create firmware implementa
 
 For more information visit the webpage: [https://fastmachinelearning.org/hls4ml/](https://fastmachinelearning.org/hls4ml/)
 
-Detailed tutorials on how to use `hls4ml`'s various functionalities can be found [here](https://github.com/thesps/hls4ml-tutorial).
+Detailed tutorials on how to use `hls4ml`'s various functionalities can be found [here](https://github.com/hls-fpga-machine-learning/hls4ml-tutorial).
 
 # Installation
 ```
@@ -45,7 +45,8 @@ hls_model = hls4ml.converters.keras_to_hls(config)
 hls4ml.utils.fetch_example_list()
 ```
 
-### Building a project with Xilinx Vitis (after downloading and installing from [here](https://www.xilinx.com/support/download/index.html/content/xilinx/en/downloadNav/vitis.html))
+### Building a project with Xilinx Vivado HLS (after downloading and installing from [here](https://www.xilinx.com/products/design-tools/vivado/integration/esl-design.html))
+Note: Vitis HLS is not yet supported. Vivado HLS versions between 2018.2 and 2020.1 are recommended.
 
 ```Python
 #Use Vivado HLS to synthesize the model
